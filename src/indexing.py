@@ -1,0 +1,274 @@
+import pickle
+import logging
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, ClassVar, Generic, Literal, TypeVar
+
+import numpy as np
+from fastembed import SparseTextEmbedding, TextEmbedding
+from pydantic import BaseModel, ConfigDict
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    PointStruct,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+)
+from tqdm.auto import tqdm
+
+from src.dataset import Document
+
+T = TypeVar("T", bound=BaseModel)
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingCache:
+    """Disk-backed cache of vectors keyed by (model_id, item_id).
+
+    Survives kernel restarts so a stopped/crashed upload doesn't lose work.
+    One pickle file per (model_id, kind). Atomic write via tmp-then-rename.
+    """
+
+    def __init__(self, cache_dir: str | Path = "./.embedding_cache") -> None:
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._memory: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _path(self, model_id: str, kind: str) -> Path:
+        safe = model_id.replace("/", "__")
+        return self.cache_dir / f"{safe}.{kind}.pkl"
+
+    def load(self, model_id: str, kind: str) -> dict[str, Any]:
+        key = (model_id, kind)
+        if key in self._memory:
+            return self._memory[key]
+        p = self._path(model_id, kind)
+        data: dict[str, Any] = {}
+        if p.exists():
+            with p.open("rb") as f:
+                data = pickle.load(f)
+        self._memory[key] = data
+        return data
+
+    def save(self, model_id: str, kind: str) -> None:
+        key = (model_id, kind)
+        if key not in self._memory:
+            return
+        p = self._path(model_id, kind)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(self._memory[key], f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(p)
+
+
+class EmbeddingConfig(BaseModel):
+    """One named vector slot in a Qdrant collection.
+
+    Extend a collection by appending another EmbeddingConfig to the indexer's
+    `embeddings` list — the slot's `name` becomes the named-vector key on every
+    PointStruct.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    name: str
+    model_id: str
+    kind: Literal["dense", "sparse"]
+    size: int | None = None
+    distance: Distance = Distance.COSINE
+    providers: list[str] | None = None
+
+
+class BaseIndexer(ABC, Generic[T]):
+    """Manage a Qdrant collection of items of type T.
+
+    Subclasses bind T via `item_type` and implement item_id/text/payload. The
+    base class owns collection creation, batched embedding across N vector
+    slots, and upload.
+    """
+
+    item_type: ClassVar[type[BaseModel]]
+
+    def __init__(
+        self,
+        client: QdrantClient,
+        collection_name: str,
+        embeddings: list[EmbeddingConfig],
+        cache: EmbeddingCache | None = None,
+    ) -> None:
+        assert len(embeddings) > 0
+        self.client = client
+        self.collection_name = collection_name
+        self.embeddings = embeddings
+        self.cache = cache
+        self._dense_models: dict[str, TextEmbedding] = {}
+        self._sparse_models: dict[str, SparseTextEmbedding] = {}
+
+    @abstractmethod
+    def item_id(self, item: T) -> int | str: ...
+
+    @abstractmethod
+    def item_text(self, item: T) -> str: ...
+
+    @abstractmethod
+    def item_payload(self, item: T) -> dict[str, Any]: ...
+
+    def ensure_collection(self, recreate: bool = False) -> None:
+        """Create the collection with the configured vector slots.
+
+        If the collection already exists and `recreate` is False, no-op. If
+        True, drop and recreate so schema changes (new vector slot) take effect.
+        """
+        exists = self.client.collection_exists(self.collection_name)
+        if exists and not recreate:
+            return
+        if exists:
+            self.client.delete_collection(self.collection_name)
+
+        dense_config = {
+            cfg.name: VectorParams(size=self._dense_size(cfg), distance=cfg.distance)
+            for cfg in self.embeddings
+            if cfg.kind == "dense"
+        }
+        sparse_config = {
+            cfg.name: SparseVectorParams()
+            for cfg in self.embeddings
+            if cfg.kind == "sparse"
+        }
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config=dense_config or None,
+            sparse_vectors_config=sparse_config or None,
+        )
+
+    def upload(
+        self,
+        items: Sequence[T],
+        batch_size: int = 64,
+        parallel: int = 1,
+    ) -> None:
+        """Embed `items` for every configured slot and upload as PointStructs.
+
+        Raises TypeError if items aren't `item_type` — guards against using the
+        wrong indexer subclass for the data.
+        """
+        if not items:
+            return
+        if not isinstance(items[0], self.item_type):
+            raise TypeError(
+                f"{type(self).__name__} expects {self.item_type.__name__}, "
+                f"got {type(items[0]).__name__}"
+            )
+
+        texts = [self.item_text(i) for i in items]
+        ids = [self.item_id(i) for i in items]
+        payloads = [self.item_payload(i) for i in items]
+
+        vectors: list[dict[str, Any]] = [{} for _ in items]
+        for cfg in self.embeddings:
+            for i, vec in enumerate(self._vectors_for(cfg, ids, texts, batch_size)):
+                vectors[i][cfg.name] = vec
+
+        points = [
+            PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
+            for i in range(len(items))
+        ]
+        self.client.upload_points(
+            collection_name=self.collection_name,
+            points=points,
+            batch_size=batch_size,
+            parallel=parallel,
+            wait=True,
+        )
+
+    def _vectors_for(
+        self,
+        cfg: EmbeddingConfig,
+        ids: list[int | str],
+        texts: list[str],
+        batch_size: int,
+    ) -> list[Any]:
+        """Return vectors aligned with `ids`/`texts`, hitting cache where possible."""
+        cache = self.cache.load(cfg.model_id, cfg.kind) if self.cache else None
+        if cache is None:
+            return self._embed(cfg, texts, batch_size)
+
+        missing_idx = [i for i, id_ in enumerate(ids) if str(id_) not in cache]
+        if missing_idx:
+            missing_texts = [texts[i] for i in missing_idx]
+            new_vecs = self._embed(cfg, missing_texts, batch_size)
+            for pos, original_i in enumerate(missing_idx):
+                cache[str(ids[original_i])] = new_vecs[pos]
+            if self.cache:
+                self.cache.save(cfg.model_id, cfg.kind)
+            else:
+                logging.warning("Cannot save the cache")
+
+        return [cache[str(id_)] for id_ in ids]
+
+    def _embed(
+        self,
+        cfg: EmbeddingConfig,
+        texts: list[str],
+        batch_size: int,
+    ) -> list[Any]:
+        if cfg.kind == "dense":
+            model = self._dense(cfg)
+            stream = tqdm(
+                model.embed(texts, batch_size=batch_size),
+                total=len(texts),
+                desc=f"embed:{cfg.name}",
+            )
+            return [np.asarray(v, dtype=np.float32) for v in stream]
+
+        model = self._sparse(cfg)
+        stream = tqdm(
+            model.embed(texts, batch_size=batch_size),
+            total=len(texts),
+            desc=f"embed:{cfg.name}",
+        )
+        return [
+            SparseVector(
+                indices=np.asarray(s.indices, dtype=np.int64).tolist(),
+                values=np.asarray(s.values, dtype=np.float32).tolist(),
+            )
+            for s in stream
+        ]
+
+    def _dense(self, cfg: EmbeddingConfig) -> TextEmbedding:
+        if cfg.model_id not in self._dense_models:
+            self._dense_models[cfg.model_id] = TextEmbedding(
+                cfg.model_id, providers=cfg.providers
+            )
+        return self._dense_models[cfg.model_id]
+
+    def _sparse(self, cfg: EmbeddingConfig) -> SparseTextEmbedding:
+        if cfg.model_id not in self._sparse_models:
+            self._sparse_models[cfg.model_id] = SparseTextEmbedding(
+                cfg.model_id, providers=cfg.providers
+            )
+        return self._sparse_models[cfg.model_id]
+
+    @staticmethod
+    def _dense_size(cfg: EmbeddingConfig) -> int:
+        if cfg.size is None:
+            raise ValueError(f"Dense embedding {cfg.name!r} requires `size`.")
+        return cfg.size
+
+
+class DocumentIndexer(BaseIndexer[Document]):
+    """Index Document items (doc_id, text) — the CLERC corpus."""
+
+    item_type = Document
+
+    def item_id(self, item: Document) -> int:
+        return int(item.doc_id)
+
+    def item_text(self, item: Document) -> str:
+        return item.text
+
+    def item_payload(self, item: Document) -> dict[str, Any]:
+        return {"doc_id": item.doc_id, "text": item.text}
