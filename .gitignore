@@ -1,3 +1,7 @@
 .venv
 __pycache__
 **/.cache/*
+.embedding_cache
+.claude 
+clerc
+.env
