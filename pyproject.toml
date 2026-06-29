@@ -5,11 +5,29 @@ description = ""
 authors = [
     {name = "andrei.cristea",email = "andrei.cristea@qdrant.com"}
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
+    "qdrant-client (>=1.18.0,<2.0.0)",
+    "datasets (>=5.0.0,<6.0.0)",
+    "huggingface-hub (>=0.23.0)",
+    "tqdm (>=4.66.0)",
+    "ipywidgets (>=8.1.8,<9.0.0)",
+    "requests (>=2.32.0)",
+    "fastembed (>=0.8.0,<0.9.0)",
+    "pydantic (>=2.13.4,<3.0.0)",
+    "litellm (>=1.50.0,<2.0.0)",
+    "instructor (>=1.15.3,<2.0.0)"
 ]
 
+
+[tool.poetry]
+packages = [{include = "src"}]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "ipykernel (>=7.3.0,<8.0.0)"
+]
