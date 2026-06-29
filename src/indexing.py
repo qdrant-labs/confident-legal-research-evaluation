@@ -1,7 +1,7 @@
-import pickle
 import logging
+import pickle
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Generic, Literal, TypeVar
 
@@ -23,6 +23,13 @@ from src.dataset import Document
 T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
+
+_CACHE_SAVE_EVERY = 2000
+
+
+def _chunked(seq: list[Any], size: int) -> Iterator[list[Any]]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
 
 class EmbeddingCache:
@@ -80,6 +87,10 @@ class EmbeddingConfig(BaseModel):
     size: int | None = None
     distance: Distance = Distance.COSINE
     providers: list[str] | None = None
+    parallel: int | None = None
+    """fastembed multi-process workers for CPU inference. None = single process.
+    Set to number of CPU cores - 1 for ~2-4x speedup on CPU. Leave None when
+    using GPU providers."""
 
 
 class BaseIndexer(ABC, Generic[T]):
@@ -99,7 +110,8 @@ class BaseIndexer(ABC, Generic[T]):
         embeddings: list[EmbeddingConfig],
         cache: EmbeddingCache | None = None,
     ) -> None:
-        assert len(embeddings) > 0
+        if not embeddings:
+            raise ValueError("Indexer requires at least one EmbeddingConfig.")
         self.client = client
         self.collection_name = collection_name
         self.embeddings = embeddings
@@ -148,7 +160,6 @@ class BaseIndexer(ABC, Generic[T]):
         self,
         items: Sequence[T],
         batch_size: int = 64,
-        parallel: int = 1,
     ) -> None:
         """Embed `items` for every configured slot and upload as PointStructs.
 
@@ -176,13 +187,19 @@ class BaseIndexer(ABC, Generic[T]):
             PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
             for i in range(len(items))
         ]
-        self.client.upload_points(
-            collection_name=self.collection_name,
-            points=points,
-            batch_size=batch_size,
-            parallel=parallel,
-            wait=True,
-        )
+        for chunk in _chunked(points, batch_size):
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=chunk,
+                wait=True,
+            )
+
+        actual = self.client.count(self.collection_name, exact=True).count
+        if actual < len(points):
+            raise RuntimeError(
+                f"Upload incomplete for {self.collection_name!r}: "
+                f"expected >={len(points)} points, got {actual}."
+            )
 
     def _vectors_for(
         self,
@@ -192,20 +209,24 @@ class BaseIndexer(ABC, Generic[T]):
         batch_size: int,
     ) -> list[Any]:
         """Return vectors aligned with `ids`/`texts`, hitting cache where possible."""
-        cache = self.cache.load(cfg.model_id, cfg.kind) if self.cache else None
-        if cache is None:
+        if self.cache is None:
             return self._embed(cfg, texts, batch_size)
+
+        store = self.cache
+        cache = store.load(cfg.model_id, cfg.kind)
 
         missing_idx = [i for i, id_ in enumerate(ids) if str(id_) not in cache]
         if missing_idx:
             missing_texts = [texts[i] for i in missing_idx]
-            new_vecs = self._embed(cfg, missing_texts, batch_size)
-            for pos, original_i in enumerate(missing_idx):
-                cache[str(ids[original_i])] = new_vecs[pos]
-            if self.cache:
-                self.cache.save(cfg.model_id, cfg.kind)
-            else:
-                logging.warning("Cannot save the cache")
+            try:
+                new_vecs = self._embed(cfg, missing_texts, batch_size)
+                for pos, original_i in enumerate(missing_idx):
+                    cache[str(ids[original_i])] = new_vecs[pos]
+                    if (pos + 1) % _CACHE_SAVE_EVERY == 0:
+                        store.save(cfg.model_id, cfg.kind)
+            finally:
+                # flush whatever we got, even on Ctrl-C / OOM mid-embedding
+                store.save(cfg.model_id, cfg.kind)
 
         return [cache[str(id_)] for id_ in ids]
 
@@ -218,7 +239,7 @@ class BaseIndexer(ABC, Generic[T]):
         if cfg.kind == "dense":
             model = self._dense(cfg)
             stream = tqdm(
-                model.embed(texts, batch_size=batch_size),
+                model.embed(texts, batch_size=batch_size, parallel=cfg.parallel),
                 total=len(texts),
                 desc=f"embed:{cfg.name}",
             )
@@ -226,7 +247,7 @@ class BaseIndexer(ABC, Generic[T]):
 
         model = self._sparse(cfg)
         stream = tqdm(
-            model.embed(texts, batch_size=batch_size),
+            model.embed(texts, batch_size=batch_size, parallel=cfg.parallel),
             total=len(texts),
             desc=f"embed:{cfg.name}",
         )
