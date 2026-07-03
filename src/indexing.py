@@ -7,10 +7,12 @@ from typing import Any, ClassVar, Generic, Literal, TypeVar
 
 import numpy as np
 from fastembed import SparseTextEmbedding, TextEmbedding
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
 from qdrant_client.models import (
     Distance,
+    Modifier,
     PointStruct,
     SparseVector,
     SparseVectorParams,
@@ -84,13 +86,40 @@ class EmbeddingConfig(BaseModel):
     name: str
     model_id: str
     kind: Literal["dense", "sparse"]
+    backend: Literal["fastembed", "sentence-transformers"] = "fastembed"
+    """Which embedding library to load `model_id` with. `sentence-transformers`
+    unlocks MPS/CUDA acceleration for dense models; `fastembed` is required for
+    sparse (BM25/SPLADE/miniCOIL)."""
     size: int | None = None
     distance: Distance = Distance.COSINE
     providers: list[str] | None = None
+    """fastembed ONNX Runtime execution providers. Ignored when
+    backend='sentence-transformers'."""
     parallel: int | None = None
     """fastembed multi-process workers for CPU inference. None = single process.
     Set to number of CPU cores - 1 for ~2-4x speedup on CPU. Leave None when
-    using GPU providers."""
+    using GPU providers. Ignored when backend='sentence-transformers'."""
+    device: str | None = None
+    """sentence-transformers device ('mps', 'cuda', 'cpu'). None auto-detects.
+    Ignored when backend='fastembed'."""
+    query_prompt: str | None = None
+    """Prefix prepended to queries at search time. Required for bge dense models
+    under sentence-transformers to match fastembed's built-in query formatting:
+    `'Represent this sentence for searching relevant passages: '`. Skipping it
+    silently drops retrieval quality."""
+    modifier: Modifier | None = None
+    """Server-side score adjustment for sparse vectors. Set `Modifier.IDF` for
+    BM25/miniCOIL so Qdrant applies IDF using collection-wide term stats;
+    without it, sparse scoring falls back to raw TF and quality drops."""
+
+    @model_validator(mode="after")
+    def _check_backend(self) -> "EmbeddingConfig":
+        if self.backend == "sentence-transformers" and self.kind != "dense":
+            raise ValueError(
+                "sentence-transformers backend supports dense embeddings only; "
+                "keep sparse slots on fastembed."
+            )
+        return self
 
 
 class BaseIndexer(ABC, Generic[T]):
@@ -118,6 +147,7 @@ class BaseIndexer(ABC, Generic[T]):
         self.cache = cache
         self._dense_models: dict[str, TextEmbedding] = {}
         self._sparse_models: dict[str, SparseTextEmbedding] = {}
+        self._st_models: dict[str, SentenceTransformer] = {}
 
     @abstractmethod
     def item_id(self, item: T) -> int | str: ...
@@ -146,7 +176,7 @@ class BaseIndexer(ABC, Generic[T]):
             if cfg.kind == "dense"
         }
         sparse_config = {
-            cfg.name: SparseVectorParams()
+            cfg.name: SparseVectorParams(modifier=cfg.modifier)
             for cfg in self.embeddings
             if cfg.kind == "sparse"
         }
@@ -237,13 +267,9 @@ class BaseIndexer(ABC, Generic[T]):
         batch_size: int,
     ) -> list[Any]:
         if cfg.kind == "dense":
-            model = self._dense(cfg)
-            stream = tqdm(
-                model.embed(texts, batch_size=batch_size, parallel=cfg.parallel),
-                total=len(texts),
-                desc=f"embed:{cfg.name}",
-            )
-            return [np.asarray(v, dtype=np.float32) for v in stream]
+            if cfg.backend == "sentence-transformers":
+                return self._embed_dense_st(cfg, texts, batch_size)
+            return self._embed_dense_fastembed(cfg, texts, batch_size)
 
         model = self._sparse(cfg)
         stream = tqdm(
@@ -259,6 +285,30 @@ class BaseIndexer(ABC, Generic[T]):
             for s in stream
         ]
 
+    def _embed_dense_fastembed(
+        self, cfg: EmbeddingConfig, texts: list[str], batch_size: int
+    ) -> list[np.ndarray]:
+        model = self._dense(cfg)
+        stream = tqdm(
+            model.embed(texts, batch_size=batch_size, parallel=cfg.parallel),
+            total=len(texts),
+            desc=f"embed:{cfg.name}",
+        )
+        return [np.asarray(v, dtype=np.float32) for v in stream]
+
+    def _embed_dense_st(
+        self, cfg: EmbeddingConfig, texts: list[str], batch_size: int
+    ) -> list[np.ndarray]:
+        model = self._st(cfg)
+        matrix = model.encode(
+            texts,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+            normalize_embeddings=cfg.distance == Distance.COSINE,
+        )
+        return [np.asarray(v, dtype=np.float32) for v in matrix]
+
     def _dense(self, cfg: EmbeddingConfig) -> TextEmbedding:
         if cfg.model_id not in self._dense_models:
             self._dense_models[cfg.model_id] = TextEmbedding(
@@ -272,6 +322,13 @@ class BaseIndexer(ABC, Generic[T]):
                 cfg.model_id, providers=cfg.providers
             )
         return self._sparse_models[cfg.model_id]
+
+    def _st(self, cfg: EmbeddingConfig) -> SentenceTransformer:
+        if cfg.model_id not in self._st_models:
+            self._st_models[cfg.model_id] = SentenceTransformer(
+                cfg.model_id, device=cfg.device
+            )
+        return self._st_models[cfg.model_id]
 
     @staticmethod
     def _dense_size(cfg: EmbeddingConfig) -> int:
