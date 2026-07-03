@@ -4,7 +4,7 @@ import instructor
 import litellm
 from pydantic import BaseModel, Field
 
-from src.search import DenseSearcher, SearchHit
+from src.search import SearchHit, Searcher
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +74,13 @@ class RAGAnswer(BaseModel):
 class LegalAssistant:
     """Retrieval-augmented Q&A for junior law firm associates.
 
-    Pipeline: dense search via `DenseSearcher` → synthesize a cited answer
-    via instructor + litellm, with response shape enforced by `_AnswerPayload`.
+    Pipeline: retrieval via any `Searcher` → synthesize a cited answer via
+    instructor + litellm, with response shape enforced by `_AnswerPayload`.
     """
 
     def __init__(
         self,
-        searcher: DenseSearcher,
+        searcher: Searcher,
         model: str = DEFAULT_MODEL,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         top_k: int = DEFAULT_TOP_K,
