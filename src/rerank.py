@@ -38,7 +38,7 @@ class CrossEncoderStrategy(RerankStrategy):
     """
 
     name: ClassVar[str] = "CrossEncoder"
-    DEFAULT_MODEL: ClassVar[str] = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+    DEFAULT_MODEL: ClassVar[str] = "Xenova/ms-marco-MiniLM-L-6-v2"
 
     def __init__(
         self,
@@ -48,13 +48,13 @@ class CrossEncoderStrategy(RerankStrategy):
     ) -> None:
         self.model_id = model_id
         self.batch_size = batch_size
-        self._model = CrossEncoder(model_id, device=device)
+        self._model = TextCrossEncoder(model_id, device=device)
 
     def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
         if not hits:
             return []
         pairs = [(query, h.text) for h in hits]
-        scores = self._model.predict(
+        scores = self._model.rerank_pairs(
             pairs,
             batch_size=self.batch_size,
             show_progress_bar=False,
