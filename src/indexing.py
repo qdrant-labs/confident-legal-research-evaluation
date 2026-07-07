@@ -170,11 +170,24 @@ class BaseIndexer(ABC, Generic[T]):
         if exists:
             self.client.delete_collection(self.collection_name)
 
-        dense_config = {
-            cfg.name: VectorParams(size=self._dense_size(cfg), distance=cfg.distance)
-            for cfg in self.embeddings
-            if cfg.kind == "dense"
-        }
+        dense_config: dict[str, VectorParams] = {}
+        for cfg in self.embeddings:
+            hnsw = HnswConfigDiff(m=cfg.hnsw_m) if cfg.hnsw_m is not None else None
+            if cfg.kind == "dense":
+                dense_config[cfg.name] = VectorParams(
+                    size=self._dense_size(cfg),
+                    distance=cfg.distance,
+                    hnsw_config=hnsw,
+                )
+            elif cfg.kind == "late_interaction":
+                dense_config[cfg.name] = VectorParams(
+                    size=self._dense_size(cfg),
+                    distance=cfg.distance,
+                    multivector_config=MultiVectorConfig(
+                        comparator=MultiVectorComparator.MAX_SIM,
+                    ),
+                    hnsw_config=hnsw,
+                )
         sparse_config = {
             cfg.name: SparseVectorParams(modifier=cfg.modifier)
             for cfg in self.embeddings
@@ -190,8 +203,16 @@ class BaseIndexer(ABC, Generic[T]):
         self,
         items: Sequence[T],
         batch_size: int = 64,
+        parallel: int = 1,
+        skip_existing: bool = False,
     ) -> None:
         """Embed `items` for every configured slot and upload as PointStructs.
+
+        `parallel` > 1 keeps that many upsert requests in flight — the main
+        lever under `cloud_inference`, where server-side embedding dominates
+        request latency and sequential batches leave the connection idle.
+        `skip_existing` drops items whose id is already in the collection, so
+        an interrupted bulk upload resumes without re-paying inference.
 
         Raises TypeError if items aren't `item_type` — guards against using the
         wrong indexer subclass for the data.
@@ -203,6 +224,17 @@ class BaseIndexer(ABC, Generic[T]):
                 f"{type(self).__name__} expects {self.item_type.__name__}, "
                 f"got {type(items[0]).__name__}"
             )
+
+        if skip_existing:
+            existing = self._existing_ids([self.item_id(i) for i in items])
+            if existing:
+                logger.info(
+                    f"Skipping {len(existing)} of {len(items)} items already "
+                    f"in {self.collection_name!r}"
+                )
+            items = [i for i in items if self.item_id(i) not in existing]
+            if not items:
+                return
 
         texts = [self.item_text(i) for i in items]
         ids = [self.item_id(i) for i in items]
@@ -217,19 +249,37 @@ class BaseIndexer(ABC, Generic[T]):
             PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
             for i in range(len(items))
         ]
-        for chunk in _chunked(points, batch_size):
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=chunk,
-                wait=True,
-            )
+        chunks = list(_chunked(points, batch_size))
+        if parallel <= 1:
+            for chunk in tqdm(chunks, desc="upsert"):
+                self._upsert(chunk)
+            return
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(self._upsert, chunk) for chunk in chunks]
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="upsert"
+            ):
+                future.result()
 
-        actual = self.client.count(self.collection_name, exact=True).count
-        if actual < len(points):
-            raise RuntimeError(
-                f"Upload incomplete for {self.collection_name!r}: "
-                f"expected >={len(points)} points, got {actual}."
+    def _upsert(self, points: list[PointStruct]) -> None:
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points,
+            wait=True,
+        )
+
+    def _existing_ids(self, ids: list[int | str]) -> set[int | str]:
+        """Ids from `ids` that are already stored in the collection."""
+        existing: set[int | str] = set()
+        for chunk in _chunked(ids, 1000):
+            records = self.client.retrieve(
+                collection_name=self.collection_name,
+                ids=chunk,
+                with_payload=False,
+                with_vectors=False,
             )
+            existing.update(record.id for record in records)
+        return existing
 
     def _vectors_for(
         self,
