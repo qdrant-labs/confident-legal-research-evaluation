@@ -2,22 +2,26 @@ import logging
 import pickle
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, ClassVar, Generic, Literal, TypeVar
 
 import numpy as np
-from fastembed import SparseTextEmbedding, TextEmbedding
+from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding, TextEmbedding
 from pydantic import BaseModel, ConfigDict, model_validator
-from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
     Distance,
+    HnswConfigDiff,
     Modifier,
+    MultiVectorComparator,
+    MultiVectorConfig,
     PointStruct,
     SparseVector,
     SparseVectorParams,
     VectorParams,
 )
+from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
 from src.dataset import Document
@@ -85,7 +89,7 @@ class EmbeddingConfig(BaseModel):
 
     name: str
     model_id: str
-    kind: Literal["dense", "sparse"]
+    kind: Literal["dense", "sparse", "late_interaction"]
     backend: Literal["fastembed", "sentence-transformers"] = "fastembed"
     """Which embedding library to load `model_id` with. `sentence-transformers`
     unlocks MPS/CUDA acceleration for dense models; `fastembed` is required for
@@ -111,6 +115,11 @@ class EmbeddingConfig(BaseModel):
     """Server-side score adjustment for sparse vectors. Set `Modifier.IDF` for
     BM25/miniCOIL so Qdrant applies IDF using collection-wide term stats;
     without it, sparse scoring falls back to raw TF and quality drops."""
+    hnsw_m: int | None = None
+    """Per-slot HNSW `m` override (dense/late-interaction only). Set 0 for
+    slots used exclusively to rescore prefetched candidates (e.g. a ColBERT
+    rerank slot) — no graph is built, saving hours of background indexing on
+    multivectors. None keeps the server default."""
 
     @model_validator(mode="after")
     def _check_backend(self) -> "EmbeddingConfig":
@@ -145,7 +154,9 @@ class BaseIndexer(ABC, Generic[T]):
         self.collection_name = collection_name
         self.embeddings = embeddings
         self.cache = cache
+        self.cloud_inference = client.cloud_inference
         self._dense_models: dict[str, TextEmbedding] = {}
+        self._late_interaction_models: dict[str, LateInteractionTextEmbedding] = {}
         self._sparse_models: dict[str, SparseTextEmbedding] = {}
         self._st_models: dict[str, SentenceTransformer] = {}
 
@@ -170,11 +181,24 @@ class BaseIndexer(ABC, Generic[T]):
         if exists:
             self.client.delete_collection(self.collection_name)
 
-        dense_config = {
-            cfg.name: VectorParams(size=self._dense_size(cfg), distance=cfg.distance)
-            for cfg in self.embeddings
-            if cfg.kind == "dense"
-        }
+        dense_config: dict[str, VectorParams] = {}
+        for cfg in self.embeddings:
+            hnsw = HnswConfigDiff(m=cfg.hnsw_m) if cfg.hnsw_m is not None else None
+            if cfg.kind == "dense":
+                dense_config[cfg.name] = VectorParams(
+                    size=self._dense_size(cfg),
+                    distance=cfg.distance,
+                    hnsw_config=hnsw,
+                )
+            elif cfg.kind == "late_interaction":
+                dense_config[cfg.name] = VectorParams(
+                    size=self._dense_size(cfg),
+                    distance=cfg.distance,
+                    multivector_config=MultiVectorConfig(
+                        comparator=MultiVectorComparator.MAX_SIM,
+                    ),
+                    hnsw_config=hnsw,
+                )
         sparse_config = {
             cfg.name: SparseVectorParams(modifier=cfg.modifier)
             for cfg in self.embeddings
@@ -190,8 +214,16 @@ class BaseIndexer(ABC, Generic[T]):
         self,
         items: Sequence[T],
         batch_size: int = 64,
+        parallel: int = 1,
+        skip_existing: bool = False,
     ) -> None:
         """Embed `items` for every configured slot and upload as PointStructs.
+
+        `parallel` > 1 keeps that many upsert requests in flight — the main
+        lever under `cloud_inference`, where server-side embedding dominates
+        request latency and sequential batches leave the connection idle.
+        `skip_existing` drops items whose id is already in the collection, so
+        an interrupted bulk upload resumes without re-paying inference.
 
         Raises TypeError if items aren't `item_type` — guards against using the
         wrong indexer subclass for the data.
@@ -203,6 +235,17 @@ class BaseIndexer(ABC, Generic[T]):
                 f"{type(self).__name__} expects {self.item_type.__name__}, "
                 f"got {type(items[0]).__name__}"
             )
+
+        if skip_existing:
+            existing = self._existing_ids([self.item_id(i) for i in items])
+            if existing:
+                logger.info(
+                    f"Skipping {len(existing)} of {len(items)} items already "
+                    f"in {self.collection_name!r}"
+                )
+            items = [i for i in items if self.item_id(i) not in existing]
+            if not items:
+                return
 
         texts = [self.item_text(i) for i in items]
         ids = [self.item_id(i) for i in items]
@@ -217,19 +260,37 @@ class BaseIndexer(ABC, Generic[T]):
             PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
             for i in range(len(items))
         ]
-        for chunk in _chunked(points, batch_size):
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=chunk,
-                wait=True,
-            )
+        chunks = list(_chunked(points, batch_size))
+        if parallel <= 1:
+            for chunk in tqdm(chunks, desc="upsert"):
+                self._upsert(chunk)
+            return
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(self._upsert, chunk) for chunk in chunks]
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="upsert"
+            ):
+                future.result()
 
-        actual = self.client.count(self.collection_name, exact=True).count
-        if actual < len(points):
-            raise RuntimeError(
-                f"Upload incomplete for {self.collection_name!r}: "
-                f"expected >={len(points)} points, got {actual}."
+    def _upsert(self, points: list[PointStruct]) -> None:
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points,
+            wait=True,
+        )
+
+    def _existing_ids(self, ids: list[int | str]) -> set[int | str]:
+        """Ids from `ids` that are already stored in the collection."""
+        existing: set[int | str] = set()
+        for chunk in _chunked(ids, 1000):
+            records = self.client.retrieve(
+                collection_name=self.collection_name,
+                ids=chunk,
+                with_payload=False,
+                with_vectors=False,
             )
+            existing.update(record.id for record in records)
+        return existing
 
     def _vectors_for(
         self,
@@ -238,7 +299,14 @@ class BaseIndexer(ABC, Generic[T]):
         texts: list[str],
         batch_size: int,
     ) -> list[Any]:
-        """Return vectors aligned with `ids`/`texts`, hitting cache where possible."""
+        """Return vectors aligned with `ids`/`texts`, hitting cache where possible.
+
+        Under `cloud_inference=True`, texts are wrapped as `Document` payloads —
+        Qdrant embeds server-side, so no local model runs and the on-disk cache
+        does not apply.
+        """
+        if self.cloud_inference:
+            return [models.Document(text=t, model=cfg.model_id) for t in texts]
         if self.cache is None:
             return self._embed(cfg, texts, batch_size)
 
@@ -266,6 +334,10 @@ class BaseIndexer(ABC, Generic[T]):
         texts: list[str],
         batch_size: int,
     ) -> list[Any]:
+        if cfg.kind == "late_interaction":
+            if cfg.backend == 'sentence-transformers':
+                raise NotImplementedError("There is no currently supported implementation for the late interaction models with 'sentence-transformers'")
+            return self._embed_late_fastembed(cfg, texts, batch_size)
         if cfg.kind == "dense":
             if cfg.backend == "sentence-transformers":
                 return self._embed_dense_st(cfg, texts, batch_size)
@@ -296,6 +368,17 @@ class BaseIndexer(ABC, Generic[T]):
         )
         return [np.asarray(v, dtype=np.float32) for v in stream]
 
+    def _embed_late_fastembed(
+        self, cfg: EmbeddingConfig, texts: list[str], batch_size: int
+    ) -> list[np.ndarray]:
+        model =  self._late_interaction(cfg)
+        stream = tqdm(
+            model.embed(texts, batch_size=batch_size, parallel=cfg.parallel),
+            total=len(texts),
+            desc=f"late_interaction:{cfg.name}",
+        )
+        return [np.asarray(v, dtype=np.float32) for v in stream]
+
     def _embed_dense_st(
         self, cfg: EmbeddingConfig, texts: list[str], batch_size: int
     ) -> list[np.ndarray]:
@@ -315,6 +398,13 @@ class BaseIndexer(ABC, Generic[T]):
                 cfg.model_id, providers=cfg.providers
             )
         return self._dense_models[cfg.model_id]
+
+    def _late_interaction(self, cfg: EmbeddingConfig) -> LateInteractionTextEmbedding:
+        if cfg.model_id not in self._dense_models:
+            self._late_interaction_models[cfg.model_id] = LateInteractionTextEmbedding(
+                cfg.model_id, providers=cfg.providers
+            )
+        return self._late_interaction_models[cfg.model_id]
 
     def _sparse(self, cfg: EmbeddingConfig) -> SparseTextEmbedding:
         if cfg.model_id not in self._sparse_models:

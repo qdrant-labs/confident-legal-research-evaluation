@@ -28,11 +28,13 @@ class ClercSplit(BaseModel):
     - corpus: passages unioned over positives + negatives, deduped by doc_id.
     - queries: query rows from the source split.
     - qrels: query_id -> set of relevant doc_ids (positives only).
+    - negatives: query_id -> doc_ids of the hard negatives mined for that query.
     """
 
     corpus: dict[str, Document]
     queries: dict[str, Query]
     qrels: dict[str, set[str]]
+    negatives: dict[str, set[str]]
 
     @override
     def __repr__(self) -> str:
@@ -66,6 +68,7 @@ def load_clerc(
     corpus: dict[str, Document] = {}
     queries: dict[str, Query] = {}
     qrels: dict[str, set[str]] = {}
+    negatives: dict[str, set[str]] = {}
 
     for row in tqdm(ds, desc="Dataset to pydantic transformation", total=len(ds)):
         if row is None or not isinstance(row, dict):
@@ -74,12 +77,13 @@ def load_clerc(
         qid = row["query_id"]
         queries[qid] = Query(query_id=qid, query=row["query"])
         qrels[qid] = {p["docid"] for p in row["positive_passages"]}
+        negatives[qid] = {p["docid"] for p in row["negative_passages"]}
         for p in (*row["positive_passages"], *row["negative_passages"]):
             did = p["docid"]
             if did not in corpus:
                 corpus[did] = Document(doc_id=did, text=p["text"])
 
-    return ClercSplit(corpus=corpus, queries=queries, qrels=qrels)
+    return ClercSplit(corpus=corpus, queries=queries, qrels=qrels, negatives=negatives)
 
 
 def download_collection(local_dir: str = "./clerc") -> str:
