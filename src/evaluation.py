@@ -1,6 +1,5 @@
 import logging
 from enum import StrEnum
-
 from typing import Literal
 
 import numpy as np
@@ -11,6 +10,7 @@ from scipy.stats import wilcoxon
 from tqdm.auto import tqdm
 
 from src.dataset import ClercSplit
+from src.doc_mapping import build_did_to_pids
 from src.search import Searcher
 
 PairwiseTest = Literal["wilcoxon", "permutation"]
@@ -64,6 +64,42 @@ class RetrievalReport(BaseModel):
 def _max_cutoff(metrics: list[RetrievalMetric]) -> int:
     return max(int(m.value.split("@")[1]) for m in metrics)
 
+
+def _build_run(
+    searcher: Searcher,
+    data: ClercSplit,
+    query_ids: list[str],
+    top_k: int,
+    desc: str = "search",
+    qrels: dict[str, dict[str, int]] | None = None,
+    metrics: list[RetrievalMetric] | None = None,
+    progress_every: int = 50,
+) -> dict[str, dict[str, float]]:
+    """Run every query through `searcher` and collect doc_id->score maps.
+
+    When `qrels` and `metrics` are given, running metric values over the
+    queries processed so far are shown on the progress bar (refreshed every
+    `progress_every` queries), so long evaluations are observable mid-flight.
+    """
+    run_dict: dict[str, dict[str, float]] = {}
+    progress = tqdm(query_ids, desc=desc)
+    for i, qid in enumerate(progress, start=1):
+        hits = searcher.search(data.queries[qid].query, limit=top_k)
+        run_dict[qid] = {hit.doc_id: hit.score for hit in hits}
+        if (
+            qrels is not None
+            and metrics is not None
+            and (i % progress_every == 0 or i == len(query_ids))
+        ):
+            partial_qrels = Qrels({q: qrels[q] for q in run_dict})
+            scores = evaluate(
+                partial_qrels, Run(dict(run_dict)), [m.value for m in metrics]
+            )
+            if isinstance(scores, float):
+                scores = {metrics[0].value: scores}
+            progress.set_postfix({k: f"{v:.3f}" for k, v in scores.items()})
+    return run_dict
+
 def evaluate_retrieval(
     searcher: Searcher,
     data: ClercSplit,
@@ -83,13 +119,12 @@ def evaluate_retrieval(
     if limit is not None:
         query_ids = query_ids[:limit]
 
-    run_dict: dict[str, dict[str, float]] = {}
-    for qid in tqdm(query_ids, desc="search"):
-        hits = searcher.search(data.queries[qid].query, limit=top_k)
-        run_dict[qid] = {hit.doc_id: hit.score for hit in hits}
+    qrels_dict = {qid: {did: 1 for did in data.qrels[qid]} for qid in query_ids}
+    run_dict = _build_run(
+        searcher, data, query_ids, top_k, qrels=qrels_dict, metrics=metrics
+    )
 
-    qrels = Qrels({qid: {did: 1 for did in data.qrels[qid]} for qid in query_ids})
-    scores = evaluate(qrels, Run(run_dict), [m.value for m in metrics])
+    scores = evaluate(Qrels(qrels_dict), Run(run_dict), [m.value for m in metrics])
     if isinstance(scores, float):
         scores = {metrics[0].value: scores}
 
@@ -97,6 +132,175 @@ def evaluate_retrieval(
         metrics={m: float(scores[m.value]) for m in metrics},
         num_queries=len(query_ids),
         top_k=top_k,
+    )
+
+
+def build_sibling_qrels(
+    data: ClercSplit,
+    pid2did: dict[str, str],
+    positive_grade: int = 2,
+    sibling_grade: int = 1,
+) -> dict[str, dict[str, int]]:
+    """Graded qrels that give partial credit for 'right document, wrong passage'.
+
+    Labeled positive passages get `positive_grade`; other pool passages of the
+    same source document (siblings) get `sibling_grade`. Under strict
+    passage-level qrels those siblings are document-level false negatives and
+    score zero.
+    """
+    did_to_pids = build_did_to_pids(data.corpus, pid2did)
+
+    qrels: dict[str, dict[str, int]] = {}
+    for qid, pos_pids in data.qrels.items():
+        graded: dict[str, int] = {}
+        for pid in pos_pids:
+            for sibling in did_to_pids[pid2did[pid]]:
+                graded[sibling] = sibling_grade
+        for pid in pos_pids:
+            graded[pid] = positive_grade
+        qrels[qid] = graded
+    return qrels
+
+
+def evaluate_retrieval_graded(
+    searcher: Searcher,
+    data: ClercSplit,
+    pid2did: dict[str, str],
+    *,
+    metrics: list[RetrievalMetric] = DEFAULT_METRICS,
+    top_k: int = 10,
+    limit: int | None = None,
+    positive_grade: int = 2,
+    sibling_grade: int = 1,
+) -> RetrievalReport:
+    """Sibling-aware variant of `evaluate_retrieval`; same report, graded qrels.
+
+    NDCG grants partial credit for retrieving a sibling of the positive;
+    Recall/MRR treat any graded passage (positive or sibling) as relevant, so
+    they become document-level lenient. Run next to `evaluate_retrieval` on
+    the same searcher to size the passage-labeling artifact per metric.
+    """
+    top_k = max(top_k, _max_cutoff(metrics))
+    logger.info(f"It is top {top_k} graded evaluation")
+    query_ids = list(data.qrels)
+    if limit is not None:
+        query_ids = query_ids[:limit]
+
+    graded = build_sibling_qrels(data, pid2did, positive_grade, sibling_grade)
+    qrels_dict = {qid: graded[qid] for qid in query_ids}
+    run_dict = _build_run(
+        searcher, data, query_ids, top_k, qrels=qrels_dict, metrics=metrics
+    )
+
+    scores = evaluate(Qrels(qrels_dict), Run(run_dict), [m.value for m in metrics])
+    if isinstance(scores, float):
+        scores = {metrics[0].value: scores}
+
+    return RetrievalReport(
+        metrics={m: float(scores[m.value]) for m in metrics},
+        num_queries=len(query_ids),
+        top_k=top_k,
+    )
+
+
+class DocLevelReport(BaseModel):
+    """Document-level diagnostics of top-k retrieval — the reranker headroom check.
+
+    Each query is classified by its best outcome in top-k: 'exact' (a labeled
+    positive passage was retrieved), 'sibling_only' (only other passages of
+    the positive document made it — right document, wrong slice), 'miss' (the
+    document is absent entirely). `mean_doc_precision` is the average fraction
+    of returned hits belonging to the positive document. A high sibling_only
+    share is headroom a sibling-aware reranker can convert into exact hits;
+    a high miss share means the retriever, not the labeling, is the problem.
+    """
+
+    num_queries: int
+    top_k: int
+    exact_query_ids: list[str]
+    sibling_only_query_ids: list[str]
+    miss_query_ids: list[str]
+    mean_doc_precision: float
+
+    def __str__(self) -> str:
+        exact = len(self.exact_query_ids)
+        sibling = len(self.sibling_only_query_ids)
+        miss = len(self.miss_query_ids)
+        doc_hits = exact + sibling
+        n = self.num_queries
+        return "\n".join(
+            [
+                f"Document-level diagnosis ({n} queries, top-{self.top_k}):",
+                f"  doc hit rate (any slice of positive doc): "
+                f"{doc_hits} ({doc_hits / n:.1%})",
+                f"    exact positive retrieved:               "
+                f"{exact} ({exact / n:.1%})",
+                f"    sibling only (right doc, wrong slice):  "
+                f"{sibling} ({sibling / n:.1%})",
+                f"  full miss (document absent):              "
+                f"{miss} ({miss / n:.1%})",
+                f"  mean doc precision@{self.top_k}:          "
+                f"{self.mean_doc_precision:.3f}",
+            ]
+        )
+
+
+def diagnose_doc_level(
+    searcher: Searcher,
+    data: ClercSplit,
+    pid2did: dict[str, str],
+    *,
+    top_k: int = 10,
+    limit: int | None = None,
+    progress_every: int = 50,
+) -> DocLevelReport:
+    """One search pass; classify each query's failure mode at document level.
+
+    Unlike NDCG — even graded — this counts events instead of averaging
+    rank-discounted scores, so it answers directly: how often is the right
+    document retrieved via the wrong passage? Query ids are kept per bucket
+    for eyeballing examples. Running bucket rates are shown on the progress
+    bar every `progress_every` queries.
+    """
+    query_ids = list(data.qrels)
+    if limit is not None:
+        query_ids = query_ids[:limit]
+
+    exact_ids: list[str] = []
+    sibling_only_ids: list[str] = []
+    miss_ids: list[str] = []
+    precisions: list[float] = []
+    progress = tqdm(query_ids, desc="diagnose")
+    for i, qid in enumerate(progress, start=1):
+        hits = searcher.search(data.queries[qid].query, limit=top_k)
+        pos_pids = data.qrels[qid]
+        pos_dids = {pid2did[pid] for pid in pos_pids}
+        hit_pids = [hit.doc_id for hit in hits]
+        in_doc = [pid for pid in hit_pids if pid2did[pid] in pos_dids]
+        precisions.append(len(in_doc) / len(hit_pids) if hit_pids else 0.0)
+        if any(pid in pos_pids for pid in hit_pids):
+            exact_ids.append(qid)
+        elif in_doc:
+            sibling_only_ids.append(qid)
+        else:
+            miss_ids.append(qid)
+        if i % progress_every == 0 or i == len(query_ids):
+            progress.set_postfix(
+                {
+                    "exact": f"{len(exact_ids) / i:.1%}",
+                    "sibling": f"{len(sibling_only_ids) / i:.1%}",
+                    "miss": f"{len(miss_ids) / i:.1%}",
+                    "doc_p": f"{np.mean(precisions):.3f}",
+                }
+            )
+
+    return DocLevelReport(
+        num_queries=len(query_ids),
+        top_k=top_k,
+        exact_query_ids=exact_ids,
+        sibling_only_query_ids=sibling_only_ids,
+        miss_query_ids=miss_ids,
+        mean_doc_precision=float(np.mean(precisions)) if precisions else 0.0,
     )
 
 
@@ -219,10 +423,7 @@ def compare_pair(
     metric_names = [m.value for m in metrics]
     per_query: dict[str, dict[str, np.ndarray]] = {}
     for name, searcher in searchers.items():
-        run_dict: dict[str, dict[str, float]] = {}
-        for qid in tqdm(query_ids, desc=f"search:{name}"):
-            hits = searcher.search(data.queries[qid].query, limit=top_k)
-            run_dict[qid] = {hit.doc_id: hit.score for hit in hits}
+        run_dict = _build_run(searcher, data, query_ids, top_k, desc=f"search:{name}")
         run = Run(run_dict)
         run.name = name
         per_query[name] = evaluate(qrels, run, metric_names, return_mean=False)
@@ -291,10 +492,7 @@ def compare_retrievers(
 
     runs: list[Run] = []
     for name, searcher in searchers.items():
-        run_dict: dict[str, dict[str, float]] = {}
-        for qid in tqdm(query_ids, desc=f"search:{name}"):
-            hits = searcher.search(data.queries[qid].query, limit=top_k)
-            run_dict[qid] = {hit.doc_id: hit.score for hit in hits}
+        run_dict = _build_run(searcher, data, query_ids, top_k, desc=f"search:{name}")
         run = Run(run_dict)
         run.name = name
         runs.append(run)
