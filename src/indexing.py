@@ -2,22 +2,26 @@ import logging
 import pickle
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, ClassVar, Generic, Literal, TypeVar
 
 import numpy as np
-from fastembed import SparseTextEmbedding, TextEmbedding
+from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding, TextEmbedding
 from pydantic import BaseModel, ConfigDict, model_validator
-from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
     Distance,
+    HnswConfigDiff,
     Modifier,
+    MultiVectorComparator,
+    MultiVectorConfig,
     PointStruct,
     SparseVector,
     SparseVectorParams,
     VectorParams,
 )
+from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
 from src.dataset import Document
@@ -85,7 +89,7 @@ class EmbeddingConfig(BaseModel):
 
     name: str
     model_id: str
-    kind: Literal["dense", "sparse"]
+    kind: Literal["dense", "sparse", "late_interaction"]
     backend: Literal["fastembed", "sentence-transformers"] = "fastembed"
     """Which embedding library to load `model_id` with. `sentence-transformers`
     unlocks MPS/CUDA acceleration for dense models; `fastembed` is required for
@@ -111,6 +115,11 @@ class EmbeddingConfig(BaseModel):
     """Server-side score adjustment for sparse vectors. Set `Modifier.IDF` for
     BM25/miniCOIL so Qdrant applies IDF using collection-wide term stats;
     without it, sparse scoring falls back to raw TF and quality drops."""
+    hnsw_m: int | None = None
+    """Per-slot HNSW `m` override (dense/late-interaction only). Set 0 for
+    slots used exclusively to rescore prefetched candidates (e.g. a ColBERT
+    rerank slot) — no graph is built, saving hours of background indexing on
+    multivectors. None keeps the server default."""
 
     @model_validator(mode="after")
     def _check_backend(self) -> "EmbeddingConfig":
@@ -145,7 +154,9 @@ class BaseIndexer(ABC, Generic[T]):
         self.collection_name = collection_name
         self.embeddings = embeddings
         self.cache = cache
+        self.cloud_inference = client.cloud_inference
         self._dense_models: dict[str, TextEmbedding] = {}
+        self._late_interaction_models: dict[str, LateInteractionTextEmbedding] = {}
         self._sparse_models: dict[str, SparseTextEmbedding] = {}
         self._st_models: dict[str, SentenceTransformer] = {}
 
@@ -288,7 +299,14 @@ class BaseIndexer(ABC, Generic[T]):
         texts: list[str],
         batch_size: int,
     ) -> list[Any]:
-        """Return vectors aligned with `ids`/`texts`, hitting cache where possible."""
+        """Return vectors aligned with `ids`/`texts`, hitting cache where possible.
+
+        Under `cloud_inference=True`, texts are wrapped as `Document` payloads —
+        Qdrant embeds server-side, so no local model runs and the on-disk cache
+        does not apply.
+        """
+        if self.cloud_inference:
+            return [models.Document(text=t, model=cfg.model_id) for t in texts]
         if self.cache is None:
             return self._embed(cfg, texts, batch_size)
 
@@ -316,6 +334,10 @@ class BaseIndexer(ABC, Generic[T]):
         texts: list[str],
         batch_size: int,
     ) -> list[Any]:
+        if cfg.kind == "late_interaction":
+            if cfg.backend == 'sentence-transformers':
+                raise NotImplementedError("There is no currently supported implementation for the late interaction models with 'sentence-transformers'")
+            return self._embed_late_fastembed(cfg, texts, batch_size)
         if cfg.kind == "dense":
             if cfg.backend == "sentence-transformers":
                 return self._embed_dense_st(cfg, texts, batch_size)
@@ -346,6 +368,17 @@ class BaseIndexer(ABC, Generic[T]):
         )
         return [np.asarray(v, dtype=np.float32) for v in stream]
 
+    def _embed_late_fastembed(
+        self, cfg: EmbeddingConfig, texts: list[str], batch_size: int
+    ) -> list[np.ndarray]:
+        model =  self._late_interaction(cfg)
+        stream = tqdm(
+            model.embed(texts, batch_size=batch_size, parallel=cfg.parallel),
+            total=len(texts),
+            desc=f"late_interaction:{cfg.name}",
+        )
+        return [np.asarray(v, dtype=np.float32) for v in stream]
+
     def _embed_dense_st(
         self, cfg: EmbeddingConfig, texts: list[str], batch_size: int
     ) -> list[np.ndarray]:
@@ -365,6 +398,13 @@ class BaseIndexer(ABC, Generic[T]):
                 cfg.model_id, providers=cfg.providers
             )
         return self._dense_models[cfg.model_id]
+
+    def _late_interaction(self, cfg: EmbeddingConfig) -> LateInteractionTextEmbedding:
+        if cfg.model_id not in self._dense_models:
+            self._late_interaction_models[cfg.model_id] = LateInteractionTextEmbedding(
+                cfg.model_id, providers=cfg.providers
+            )
+        return self._late_interaction_models[cfg.model_id]
 
     def _sparse(self, cfg: EmbeddingConfig) -> SparseTextEmbedding:
         if cfg.model_id not in self._sparse_models:
