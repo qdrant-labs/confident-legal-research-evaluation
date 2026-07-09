@@ -1,7 +1,10 @@
 import logging
+import os
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
+import httpx
 import numpy as np
 from fastembed import LateInteractionTextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
@@ -9,6 +12,7 @@ from qdrant_client import QdrantClient, models
 
 from src.dataset import Document
 from src.doc_mapping import build_did_to_pids
+from src.encoder import post_with_retry
 from src.search import Searcher, SearchHit, dedupe_by_document
 
 logger = logging.getLogger(__name__)
@@ -193,6 +197,60 @@ class QdrantLateInteractionStrategy(RerankStrategy):
         return matrix.tolist()
 
 
+class OpenRouterRerankStrategy(RerankStrategy):
+    """API reranking via OpenRouter's /rerank endpoint (Cohere rerank models).
+
+    One POST per query rescores the whole candidate pool server-side — no
+    local model, and Rerank 4's 32K context fits full legal query + passage
+    pairs, avoiding the truncation that sinks 512-token cross-encoders on
+    CLERC. Costs one 'search' per call (~$0.0025 for rerank-4-pro).
+    """
+
+    name: ClassVar[str] = "OpenRouterRerank"
+    DEFAULT_MODEL: ClassVar[str] = "cohere/rerank-4-pro"
+    API_URL: ClassVar[str] = "https://openrouter.ai/api/v1/rerank"
+
+    def __init__(
+        self,
+        model_id: str = DEFAULT_MODEL,
+        api_key: str | None = None,
+        timeout: float = 120.0,
+    ) -> None:
+        self.model_id = model_id
+        key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise ValueError(
+                "OpenRouter API key missing: pass `api_key` or set the "
+                "OPENROUTER_API_KEY environment variable."
+            )
+        self._headers = {"Authorization": f"Bearer {key}"}
+        self._client = httpx.Client(timeout=timeout)
+
+    def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
+        if not hits:
+            return []
+        body = {
+            "model": self.model_id,
+            "query": query,
+            "documents": [h.text for h in hits],
+        }
+        response = post_with_retry(self._client, self.API_URL, body, self._headers)
+        results = response.json()["results"]
+        if len(results) != len(hits):
+            raise RuntimeError(
+                f"OpenRouter reranked {len(results)} documents "
+                f"for a pool of {len(hits)} hits."
+            )
+        rescored = [
+            hits[r["index"]].model_copy(
+                update={"score": float(r["relevance_score"])}
+            )
+            for r in results
+        ]
+        rescored.sort(key=lambda h: h.score, reverse=True)
+        return rescored
+
+
 class SiblingExpansionStrategy(RerankStrategy):
     """Document-aware reranking for a pre-chunked corpus.
 
@@ -236,24 +294,25 @@ class SiblingExpansionStrategy(RerankStrategy):
 
 
 class Reranker(Searcher):
-    """Composite searcher: retrieve K candidates from an inner Searcher, re-score with a strategy.
+    """Composite searcher: rerank a multiplied candidate pool from an inner Searcher.
 
     Inherits `Searcher` so it drops into `evaluate_retrieval` / `compare_pair`.
-    `search(limit=N)` fetches `candidates` from the inner searcher (default 100),
-    reranks all of them, and returns the top-N. `candidates` controls the
-    oversampling that gives reranking room to improve top-K precision.
+    `search(limit=N)` fetches `N * multiplier` candidates from the inner
+    searcher, reranks all of them, and returns the top-N. `multiplier` controls
+    the oversampling that gives reranking room to improve top-K precision —
+    same semantics as `HybridSearcher.prefetch_multiplier`.
     """
 
     def __init__(
         self,
         retriever: Searcher,
         strategy: RerankStrategy,
-        candidates: int = 100,
+        multiplier: int = 10,
     ) -> None:
         super().__init__()
         self._retriever = retriever
         self._strategy = strategy
-        self.candidates = candidates
+        self.multiplier = multiplier
 
     def get_retriever(self) -> Searcher:
         return self._retriever
@@ -262,7 +321,15 @@ class Reranker(Searcher):
         return self._strategy
 
     def search(self, query: str, limit: int = 10) -> list[SearchHit]:
-        pool = max(self.candidates, limit)
-        hits = self._retriever.search(query, limit=pool)
+        hits = self._retriever.search(query, limit=limit * self.multiplier)
         reranked = self._strategy.rerank(query, hits)
         return reranked[:limit]
+
+    def warm_up(
+        self,
+        queries: Sequence[str],
+        batch_size: int = 64,
+        parallel: int = 8,
+    ) -> None:
+        # the inner retriever embeds the queries, so its cache must be filled
+        self._retriever.warm_up(queries, batch_size=batch_size, parallel=parallel)
