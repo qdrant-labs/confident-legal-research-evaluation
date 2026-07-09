@@ -1,6 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding, TextEmbedding
@@ -16,6 +17,7 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
+from src.encoder import OpenRouterEncoder
 from src.indexing import EmbeddingConfig
 
 logger = logging.getLogger(__name__)
@@ -67,16 +69,56 @@ class Searcher(ABC):
         self._sparse_models: dict[str, SparseTextEmbedding] = {}
         self._late_interaction_models: dict[str, LateInteractionTextEmbedding] = {}
         self._st_models: dict[str, SentenceTransformer] = {}
+        self._openrouter_models: dict[str, OpenRouterEncoder] = {}
+        self._query_vector_cache: dict[tuple[str, str], list[float]] = {}
 
     @abstractmethod
     def search(self, query: str, limit: int = 10) -> list[SearchHit]:
         """Return the top-`limit` hits ranked by relevance to `query`."""
 
+    def warm_up(
+        self,
+        queries: Sequence[str],
+        batch_size: int = 64,
+        parallel: int = 8,
+    ) -> None:
+        """Batch-embed `queries` for every openrouter dense slot ahead of time.
+
+        Fills the query-vector cache so subsequent `search()` calls skip the
+        per-query API round trip — turns N sequential requests during an eval
+        loop into N/batch_size concurrent ones up front. Queries not warmed up
+        still embed live on first use.
+        """
+        for cfg in self._warm_up_configs():
+            if cfg.backend != "openrouter" or cfg.kind != "dense":
+                continue
+            texts = [(cfg.query_prompt or "") + q for q in queries]
+            missing = [
+                t
+                for t in dict.fromkeys(texts)
+                if (cfg.model_id, t) not in self._query_vector_cache
+            ]
+            if not missing:
+                continue
+            vectors = self._openrouter(cfg).encode(
+                missing, batch_size=batch_size, parallel=parallel
+            )
+            for text, vec in zip(missing, vectors):
+                self._query_vector_cache[(cfg.model_id, text)] = vec.tolist()
+
+    def _warm_up_configs(self) -> list[EmbeddingConfig]:
+        """Configs whose query embeddings `warm_up` should precompute."""
+        return []
+
     def _query_value(self, cfg: EmbeddingConfig, query: str) -> Any:
         """Query representation for one slot: a `models.Document` embedded
-        server-side under cloud inference, a locally embedded vector otherwise."""
-        if self.cloud_inference:
-            return models.Document(text=query, model=cfg.model_id)
+        server-side under cloud inference, a locally embedded vector otherwise.
+        `backend='openrouter'` slots always embed client-side, mirroring the
+        indexing path."""
+        if self.cloud_inference and cfg.backend != "openrouter":
+            return models.Document(
+                text=query, model=cfg.model_id, options=cfg.doc_options
+            )
         if cfg.kind == "dense":
             return self._embed_dense_query(cfg, query)
         if cfg.kind == "sparse":
@@ -101,6 +143,14 @@ class Searcher(ABC):
         return hits
 
     def _embed_dense_query(self, cfg: EmbeddingConfig, query: str) -> list[float]:
+        if cfg.backend == "openrouter":
+            text = (cfg.query_prompt or "") + query
+            key = (cfg.model_id, text)
+            if key not in self._query_vector_cache:
+                encoder = self._openrouter(cfg)
+                vec = encoder.encode([text], show_progress_bar=False)[0]
+                self._query_vector_cache[key] = vec.tolist()
+            return self._query_vector_cache[key]
         if cfg.backend == "sentence-transformers":
             model = self._st(cfg)
             text = (cfg.query_prompt or "") + query
@@ -159,6 +209,13 @@ class Searcher(ABC):
             )
         return self._st_models[cfg.model_id]
 
+    def _openrouter(self, cfg: EmbeddingConfig) -> OpenRouterEncoder:
+        if cfg.model_id not in self._openrouter_models:
+            self._openrouter_models[cfg.model_id] = OpenRouterEncoder(
+                **cfg.openrouter_encoder_kwargs()
+            )
+        return self._openrouter_models[cfg.model_id]
+
 
 class UniqueDocSearcher(Searcher):
     """Document-level diversification over a passage-level retriever.
@@ -184,6 +241,15 @@ class UniqueDocSearcher(Searcher):
     def search(self, query: str, limit: int = 10) -> list[SearchHit]:
         hits = self._retriever.search(query, limit=limit * self.oversample)
         return dedupe_by_document(hits, self._pid2did, limit=limit)
+
+    def warm_up(
+        self,
+        queries: Sequence[str],
+        batch_size: int = 64,
+        parallel: int = 8,
+    ) -> None:
+        # the inner retriever embeds the queries, so its cache must be filled
+        self._retriever.warm_up(queries, batch_size=batch_size, parallel=parallel)
 
 
 class DenseSearcher(Searcher):
@@ -220,6 +286,41 @@ class DenseSearcher(Searcher):
         )
         return self._hits_from_points(result.points)
 
+    def _warm_up_configs(self) -> list[EmbeddingConfig]:
+        return [self.embedding]
+
+class SparseSearcher(Searcher):
+    """Sparse vector search against a named slot of a Qdrant collection.
+
+    Embeds the query with the same EmbeddingConfig used at index time and
+    queries the matching vector slot via `client.query_points(..., using=...)`.
+    """
+    def __init__(
+        self,
+        client: QdrantClient,
+        collection_name: str,
+        embedding: EmbeddingConfig,
+    ) -> None:
+        if embedding.kind != "sparse":
+            raise ValueError(
+                f"SparseSearch requires a sparse vector in EmbeddingConfig; "
+                f"got kind={embedding.kind!r}."
+            )
+        super().__init__()
+        self.client = client
+        self.collection_name = collection_name
+        self.embedding = embedding
+        self.cloud_inference = client.cloud_inference
+
+    def search(self, query: str, limit: int = 10) -> list[SearchHit]:
+        result = self.client.query_points(
+            collection_name=self.collection_name,
+            query=self._query_value(self.embedding, query),
+            using=self.embedding.name,
+            limit=limit,
+            with_payload=True,
+        )
+        return self._hits_from_points(result.points)
 
 class HybridSearcher(Searcher):
     """Fused search across multiple named-vector slots via Qdrant's Query API.
@@ -275,6 +376,9 @@ class HybridSearcher(Searcher):
             using=cfg.name,
             limit=limit,
         )
+
+    def _warm_up_configs(self) -> list[EmbeddingConfig]:
+        return self.embeddings
 
 
 class HybridRerankSearcher(Searcher):
@@ -337,3 +441,6 @@ class HybridRerankSearcher(Searcher):
             using=cfg.name,
             limit=limit,
         )
+
+    def _warm_up_configs(self) -> list[EmbeddingConfig]:
+        return [*self.prefetch, self.rerank]

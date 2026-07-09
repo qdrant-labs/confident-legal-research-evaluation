@@ -1,5 +1,6 @@
 import logging
 import pickle
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,8 +9,9 @@ from typing import Any, ClassVar, Generic, Literal, TypeVar
 
 import numpy as np
 from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding, TextEmbedding
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     Distance,
     HnswConfigDiff,
@@ -25,12 +27,14 @@ from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
 from src.dataset import Document
+from src.encoder import OpenRouterEncoder
 
 T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
 _CACHE_SAVE_EVERY = 2000
+_UPSERT_MAX_ATTEMPTS = 5
 
 
 def _chunked(seq: list[Any], size: int) -> Iterator[list[Any]]:
@@ -90,10 +94,14 @@ class EmbeddingConfig(BaseModel):
     name: str
     model_id: str
     kind: Literal["dense", "sparse", "late_interaction"]
-    backend: Literal["fastembed", "sentence-transformers"] = "fastembed"
+    backend: Literal["fastembed", "sentence-transformers", "openrouter"] = "fastembed"
     """Which embedding library to load `model_id` with. `sentence-transformers`
     unlocks MPS/CUDA acceleration for dense models; `fastembed` is required for
-    sparse (BM25/SPLADE/miniCOIL)."""
+    sparse (BM25/SPLADE/miniCOIL); `openrouter` embeds client-side via the
+    OpenRouter API (even when the Qdrant client runs with cloud_inference) —
+    the api key comes from doc_options['openrouter-api-key'] or the
+    OPENROUTER_API_KEY env var, remaining doc_options entries (e.g.
+    `dimensions`) are forwarded in the request body."""
     size: int | None = None
     distance: Distance = Distance.COSINE
     providers: list[str] | None = None
@@ -120,15 +128,30 @@ class EmbeddingConfig(BaseModel):
     slots used exclusively to rescore prefetched candidates (e.g. a ColBERT
     rerank slot) — no graph is built, saving hours of background indexing on
     multivectors. None keeps the server default."""
+    
+    doc_options: dict[str, Any] | None = Field(
+        None,
+        description="Additional options for the document configuration",
+        repr=False,
+        exclude=True,
+    )
+    """May carry provider API keys — kept out of repr and model_dump so it
+    never leaks into notebook outputs or serialized configs."""
 
     @model_validator(mode="after")
     def _check_backend(self) -> "EmbeddingConfig":
-        if self.backend == "sentence-transformers" and self.kind != "dense":
+        if self.backend != "fastembed" and self.kind != "dense":
             raise ValueError(
-                "sentence-transformers backend supports dense embeddings only; "
-                "keep sparse slots on fastembed."
+                f"{self.backend} backend supports dense embeddings only; "
+                "keep sparse/late-interaction slots on fastembed."
             )
         return self
+
+    def openrouter_encoder_kwargs(self) -> dict[str, Any]:
+        """Split doc_options into the encoder's api_key + request options."""
+        opts = dict(self.doc_options or {})
+        api_key = opts.pop("openrouter-api-key", None)
+        return {"model": self.model_id, "api_key": api_key, "options": opts}
 
 
 class BaseIndexer(ABC, Generic[T]):
@@ -159,6 +182,7 @@ class BaseIndexer(ABC, Generic[T]):
         self._late_interaction_models: dict[str, LateInteractionTextEmbedding] = {}
         self._sparse_models: dict[str, SparseTextEmbedding] = {}
         self._st_models: dict[str, SentenceTransformer] = {}
+        self._openrouter_models: dict[str, OpenRouterEncoder] = {}
 
     @abstractmethod
     def item_id(self, item: T) -> int | str: ...
@@ -273,11 +297,28 @@ class BaseIndexer(ABC, Generic[T]):
                 future.result()
 
     def _upsert(self, points: list[PointStruct]) -> None:
-        self.client.upsert(
-            collection_name=self.collection_name,
-            points=points,
-            wait=True,
-        )
+        # Under cloud inference the server proxies to external embedding
+        # providers, which intermittently return 5xx — retry those, fail
+        # fast on 4xx (bad request won't heal).
+        for attempt in range(1, _UPSERT_MAX_ATTEMPTS + 1):
+            try:
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=points,
+                    wait=True,
+                )
+                return
+            except UnexpectedResponse as e:
+                status = e.status_code or 0
+                if status < 500 or attempt == _UPSERT_MAX_ATTEMPTS:
+                    raise
+                delay = 2**attempt
+                logger.warning(
+                    f"Upsert got {status} (attempt {attempt}/"
+                    f"{_UPSERT_MAX_ATTEMPTS}), retrying in {delay}s: "
+                    f"{e.content[:200] if e.content else ''}"
+                )
+                time.sleep(delay)
 
     def _existing_ids(self, ids: list[int | str]) -> set[int | str]:
         """Ids from `ids` that are already stored in the collection."""
@@ -303,10 +344,15 @@ class BaseIndexer(ABC, Generic[T]):
 
         Under `cloud_inference=True`, texts are wrapped as `Document` payloads —
         Qdrant embeds server-side, so no local model runs and the on-disk cache
-        does not apply.
+        does not apply. Exception: `backend='openrouter'` slots always embed
+        client-side (direct API calls), so they stay cacheable and skip the
+        slow synchronous inference proxy.
         """
-        if self.cloud_inference:
-            return [models.Document(text=t, model=cfg.model_id) for t in texts]
+        if self.cloud_inference and cfg.backend != "openrouter":
+            return [
+                models.Document(text=t, model=cfg.model_id, options=cfg.doc_options)
+                for t in texts
+            ]
         if self.cache is None:
             return self._embed(cfg, texts, batch_size)
 
@@ -341,6 +387,10 @@ class BaseIndexer(ABC, Generic[T]):
         if cfg.kind == "dense":
             if cfg.backend == "sentence-transformers":
                 return self._embed_dense_st(cfg, texts, batch_size)
+            if cfg.backend == "openrouter":
+                return self._openrouter(cfg).encode(
+                    texts, batch_size=batch_size, parallel=cfg.parallel or 8
+                )
             return self._embed_dense_fastembed(cfg, texts, batch_size)
 
         model = self._sparse(cfg)
@@ -419,6 +469,13 @@ class BaseIndexer(ABC, Generic[T]):
                 cfg.model_id, device=cfg.device
             )
         return self._st_models[cfg.model_id]
+
+    def _openrouter(self, cfg: EmbeddingConfig) -> OpenRouterEncoder:
+        if cfg.model_id not in self._openrouter_models:
+            self._openrouter_models[cfg.model_id] = OpenRouterEncoder(
+                **cfg.openrouter_encoder_kwargs()
+            )
+        return self._openrouter_models[cfg.model_id]
 
     @staticmethod
     def _dense_size(cfg: EmbeddingConfig) -> int:
