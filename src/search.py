@@ -1,7 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 from fastembed import LateInteractionTextEmbedding, SparseTextEmbedding, TextEmbedding
@@ -19,6 +19,7 @@ from sentence_transformers import SentenceTransformer
 
 from src.encoder import OpenRouterEncoder
 from src.indexing import EmbeddingConfig
+from src.ngram_analysis import NgramSparseEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class Searcher(ABC):
         self._late_interaction_models: dict[str, LateInteractionTextEmbedding] = {}
         self._st_models: dict[str, SentenceTransformer] = {}
         self._openrouter_models: dict[str, OpenRouterEncoder] = {}
+        self._ngram_encoders: dict[str, NgramSparseEncoder] = {}
         self._query_vector_cache: dict[tuple[str, str], list[float]] = {}
 
     @abstractmethod
@@ -103,7 +105,7 @@ class Searcher(ABC):
             vectors = self._openrouter(cfg).encode(
                 missing, batch_size=batch_size, parallel=parallel
             )
-            for text, vec in zip(missing, vectors):
+            for text, vec in zip(missing, vectors, strict=True):
                 self._query_vector_cache[(cfg.model_id, text)] = vec.tolist()
 
     def _warm_up_configs(self) -> list[EmbeddingConfig]:
@@ -113,9 +115,13 @@ class Searcher(ABC):
     def _query_value(self, cfg: EmbeddingConfig, query: str) -> Any:
         """Query representation for one slot: a `models.Document` embedded
         server-side under cloud inference, a locally embedded vector otherwise.
-        `backend='openrouter'` slots always embed client-side, mirroring the
-        indexing path."""
-        if self.cloud_inference and cfg.backend != "openrouter":
+        `backend='openrouter'` and `backend='ngram'` slots always embed
+        client-side, mirroring the indexing path."""
+        if (
+            self.cloud_inference
+            and cfg.backend not in ("openrouter", "ngram")
+            and not cfg.local_inference
+        ):
             return models.Document(
                 text=query, model=cfg.model_id, options=cfg.doc_options
             )
@@ -167,6 +173,8 @@ class Searcher(ABC):
     def _embed_sparse_query(
         self, cfg: EmbeddingConfig, query: str
     ) -> SparseVector:
+        if cfg.backend == "ngram":
+            return self._ngram_encoder(cfg).encode_query(query)
         model = self._sparse(cfg)
         emb = next(iter(model.query_embed(query)))
         return SparseVector(
@@ -215,6 +223,13 @@ class Searcher(ABC):
                 **cfg.openrouter_encoder_kwargs()
             )
         return self._openrouter_models[cfg.model_id]
+
+    def _ngram_encoder(self, cfg: EmbeddingConfig) -> NgramSparseEncoder:
+        if cfg.model_id not in self._ngram_encoders:
+            self._ngram_encoders[cfg.model_id] = NgramSparseEncoder(
+                **cfg.ngram_encoder_kwargs()
+            )
+        return self._ngram_encoders[cfg.model_id]
 
 
 class UniqueDocSearcher(Searcher):
@@ -382,7 +397,7 @@ class HybridSearcher(Searcher):
 
 
 class HybridRerankSearcher(Searcher):
-    """Server-side rerank: fuse candidates from multiple slots, rescore with a final slot.
+    """Server-side rerank: fuse candidates from multiple slots, rescore with one.
 
     One Qdrant Query API call: an inner nested `Prefetch(FusionQuery(RRF))` merges
     the retrieval slots (typically dense + sparse), and the outer `query` uses the

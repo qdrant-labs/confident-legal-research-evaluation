@@ -28,6 +28,7 @@ from tqdm.auto import tqdm
 
 from src.dataset import Document
 from src.encoder import OpenRouterEncoder
+from src.ngram_analysis import NgramSparseEncoder
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -94,14 +95,19 @@ class EmbeddingConfig(BaseModel):
     name: str
     model_id: str
     kind: Literal["dense", "sparse", "late_interaction"]
-    backend: Literal["fastembed", "sentence-transformers", "openrouter"] = "fastembed"
+    backend: Literal["fastembed", "sentence-transformers", "openrouter", "ngram"] = (
+        "fastembed"
+    )
     """Which embedding library to load `model_id` with. `sentence-transformers`
     unlocks MPS/CUDA acceleration for dense models; `fastembed` is required for
-    sparse (BM25/SPLADE/miniCOIL); `openrouter` embeds client-side via the
-    OpenRouter API (even when the Qdrant client runs with cloud_inference) —
-    the api key comes from doc_options['openrouter-api-key'] or the
-    OPENROUTER_API_KEY env var, remaining doc_options entries (e.g.
-    `dimensions`) are forwarded in the request body."""
+    model-based sparse (BM25/SPLADE/miniCOIL); `openrouter` embeds client-side
+    via the OpenRouter API (even when the Qdrant client runs with
+    cloud_inference) — the api key comes from doc_options['openrouter-api-key']
+    or the OPENROUTER_API_KEY env var, remaining doc_options entries (e.g.
+    `dimensions`) are forwarded in the request body; `ngram` is the local
+    hashed word n-gram sparse encoder (`NgramSparseEncoder`) — always embeds
+    client-side, encoder params (`max_n`, `k1`, `b`, `avg_tokens`) come from
+    doc_options."""
     size: int | None = None
     distance: Distance = Distance.COSINE
     providers: list[str] | None = None
@@ -123,12 +129,16 @@ class EmbeddingConfig(BaseModel):
     """Server-side score adjustment for sparse vectors. Set `Modifier.IDF` for
     BM25/miniCOIL so Qdrant applies IDF using collection-wide term stats;
     without it, sparse scoring falls back to raw TF and quality drops."""
+    local_inference: bool = False
+    """Force client-side embedding (and cache use) for this slot even when the
+    client runs with cloud_inference. Use to bypass the slow inference proxy
+    when vectors are already cached — e.g. harvested from another collection."""
     hnsw_m: int | None = None
     """Per-slot HNSW `m` override (dense/late-interaction only). Set 0 for
     slots used exclusively to rescore prefetched candidates (e.g. a ColBERT
     rerank slot) — no graph is built, saving hours of background indexing on
     multivectors. None keeps the server default."""
-    
+
     doc_options: dict[str, Any] | None = Field(
         None,
         description="Additional options for the document configuration",
@@ -140,7 +150,10 @@ class EmbeddingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_backend(self) -> "EmbeddingConfig":
-        if self.backend != "fastembed" and self.kind != "dense":
+        if self.backend == "ngram":
+            if self.kind != "sparse":
+                raise ValueError("ngram backend produces sparse vectors only.")
+        elif self.backend != "fastembed" and self.kind != "dense":
             raise ValueError(
                 f"{self.backend} backend supports dense embeddings only; "
                 "keep sparse/late-interaction slots on fastembed."
@@ -152,6 +165,16 @@ class EmbeddingConfig(BaseModel):
         opts = dict(self.doc_options or {})
         api_key = opts.pop("openrouter-api-key", None)
         return {"model": self.model_id, "api_key": api_key, "options": opts}
+
+    def ngram_encoder_kwargs(self) -> dict[str, Any]:
+        """Encoder params from doc_options; avg_tokens is optional (query-side)."""
+        opts = dict(self.doc_options or {})
+        return {
+            "max_n": opts.get("max_n", 2),
+            "k1": opts.get("k1", 1.5),
+            "b": opts.get("b", 0.75),
+            "avg_tokens": opts.get("avg_tokens"),
+        }
 
 
 class BaseIndexer(ABC, Generic[T]):
@@ -183,6 +206,7 @@ class BaseIndexer(ABC, Generic[T]):
         self._sparse_models: dict[str, SparseTextEmbedding] = {}
         self._st_models: dict[str, SentenceTransformer] = {}
         self._openrouter_models: dict[str, OpenRouterEncoder] = {}
+        self._ngram_encoders: dict[str, NgramSparseEncoder] = {}
 
     @abstractmethod
     def item_id(self, item: T) -> int | str: ...
@@ -348,7 +372,11 @@ class BaseIndexer(ABC, Generic[T]):
         client-side (direct API calls), so they stay cacheable and skip the
         slow synchronous inference proxy.
         """
-        if self.cloud_inference and cfg.backend != "openrouter":
+        if (
+            self.cloud_inference
+            and cfg.backend not in ("openrouter", "ngram")
+            and not cfg.local_inference
+        ):
             return [
                 models.Document(text=t, model=cfg.model_id, options=cfg.doc_options)
                 for t in texts
@@ -382,7 +410,10 @@ class BaseIndexer(ABC, Generic[T]):
     ) -> list[Any]:
         if cfg.kind == "late_interaction":
             if cfg.backend == 'sentence-transformers':
-                raise NotImplementedError("There is no currently supported implementation for the late interaction models with 'sentence-transformers'")
+                raise NotImplementedError(
+                    "Late-interaction models are not supported with the "
+                    "'sentence-transformers' backend."
+                )
             return self._embed_late_fastembed(cfg, texts, batch_size)
         if cfg.kind == "dense":
             if cfg.backend == "sentence-transformers":
@@ -393,6 +424,8 @@ class BaseIndexer(ABC, Generic[T]):
                 )
             return self._embed_dense_fastembed(cfg, texts, batch_size)
 
+        if cfg.backend == "ngram":
+            return self._ngram(cfg).encode_documents(texts)
         model = self._sparse(cfg)
         stream = tqdm(
             model.embed(texts, batch_size=batch_size, parallel=cfg.parallel),
@@ -476,6 +509,89 @@ class BaseIndexer(ABC, Generic[T]):
                 **cfg.openrouter_encoder_kwargs()
             )
         return self._openrouter_models[cfg.model_id]
+
+    def _ngram(self, cfg: EmbeddingConfig) -> NgramSparseEncoder:
+        if cfg.model_id not in self._ngram_encoders:
+            self._ngram_encoders[cfg.model_id] = NgramSparseEncoder(
+                **cfg.ngram_encoder_kwargs()
+            )
+        return self._ngram_encoders[cfg.model_id]
+
+    def add_sparse_slot(self, cfg: EmbeddingConfig) -> None:
+        """Attach a sparse vector slot to an existing collection, if supported.
+
+        Server support varies: some Qdrant versions treat `update_collection`'s
+        sparse config as param-update-only and reject new names ("Not existing
+        vector name"). In that case the collection must be recreated with the
+        full slot schema — with an `EmbeddingCache`, previously embedded slots
+        upload from disk without re-paying inference. No-op if the slot
+        already exists.
+        """
+        if cfg.kind != "sparse":
+            raise ValueError("Only sparse slots can be added post-creation.")
+        info = self.client.get_collection(self.collection_name)
+        existing = (info.config.params.sparse_vectors or {}).keys()
+        if cfg.name in existing:
+            logger.info(f"Sparse slot {cfg.name!r} already exists, skipping.")
+            return
+        try:
+            self.client.update_collection(
+                collection_name=self.collection_name,
+                sparse_vectors_config={
+                    cfg.name: SparseVectorParams(modifier=cfg.modifier)
+                },
+            )
+        except UnexpectedResponse as e:
+            if e.status_code == 400:
+                raise RuntimeError(
+                    f"This Qdrant server does not support adding sparse slot "
+                    f"{cfg.name!r} to an existing collection. Recreate the "
+                    f"collection with the full schema instead (cached slots "
+                    f"re-upload without re-paying inference)."
+                ) from e
+            raise
+
+    def backfill_slot(
+        self,
+        items: Sequence[T],
+        name: str,
+        batch_size: int = 64,
+        parallel: int = 1,
+    ) -> None:
+        """Fill one vector slot on already-uploaded points, leaving others intact.
+
+        Embeds `items` for the config named `name` and pushes only that named
+        vector via `update_vectors` — existing dense/sparse vectors on the
+        points are untouched, so extending a collection does not re-pay for
+        prior (possibly API-priced) embeddings.
+        """
+        cfg = next((c for c in self.embeddings if c.name == name), None)
+        if cfg is None:
+            raise ValueError(f"No EmbeddingConfig named {name!r} on this indexer.")
+        ids = [self.item_id(i) for i in items]
+        texts = [self.item_text(i) for i in items]
+        vectors = self._vectors_for(cfg, ids, texts, batch_size)
+        points = [
+            models.PointVectors(id=ids[i], vector={name: vectors[i]})
+            for i in range(len(items))
+        ]
+        chunks = list(_chunked(points, batch_size))
+
+        def _update(chunk: list[models.PointVectors]) -> None:
+            self.client.update_vectors(
+                collection_name=self.collection_name, points=chunk, wait=True
+            )
+
+        if parallel <= 1:
+            for chunk in tqdm(chunks, desc=f"backfill:{name}"):
+                _update(chunk)
+            return
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(_update, chunk) for chunk in chunks]
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc=f"backfill:{name}"
+            ):
+                future.result()
 
     @staticmethod
     def _dense_size(cfg: EmbeddingConfig) -> int:
