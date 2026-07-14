@@ -56,7 +56,9 @@ class RetrievalReport(BaseModel):
     top_k: int
 
     def __str__(self) -> str:
-        lines = [f"Retrieval evaluation ({self.num_queries} queries, top-{self.top_k}):"]
+        lines = [
+            f"Retrieval evaluation ({self.num_queries} queries, top-{self.top_k}):"
+        ]
         for name, value in self.metrics.items():
             lines.append(f"  {name:<12} {value:.4f}")
         return "\n".join(lines)
@@ -317,10 +319,15 @@ class PairwiseMetric(BaseModel):
     ci_high: float
     p_value: float
     win_rate: float
+    loss_rate: float
+
+    @property
+    def tie_rate(self) -> float:
+        return 1.0 - self.win_rate - self.loss_rate
 
 
 class PairwiseComparisonReport(BaseModel):
-    """Formatted 2-run comparison: mean deltas, bootstrap CIs, permutation p-values, win rates."""
+    """2-run comparison: mean deltas, bootstrap CIs, p-values, win/loss/tie rates."""
 
     name_a: str
     name_b: str
@@ -345,7 +352,9 @@ class PairwiseComparisonReport(BaseModel):
                 f"Δ = {m.delta:+.3f}   "
                 f"{int(self.ci_level * 100)}% CI [{m.ci_low:+.3f}, {m.ci_high:+.3f}]   "
                 f"p = {m.p_value:.1e}   "
-                f"{self.name_b}>{self.name_a} in {m.win_rate * 100:.1f}% of queries"
+                f"{self.name_b}>{self.name_a}: {m.win_rate:.1%} | "
+                f"{self.name_a}>{self.name_b}: {m.loss_rate:.1%} | "
+                f"ties: {m.tie_rate:.1%}"
             )
         return "\n".join(lines)
 
@@ -359,8 +368,8 @@ def _pairwise_stats(
     ci_level: float,
     stat_test: PairwiseTest,
     rng: np.random.Generator,
-) -> tuple[float, float, float, float, float]:
-    """Compute (delta, ci_low, ci_high, p_value, win_rate) for paired scores.
+) -> tuple[float, float, float, float]:
+    """Compute (delta, ci_low, ci_high, p_value) for paired scores.
 
     `stat_test="wilcoxon"` uses scipy's signed-rank test — asymptotic normal
     approximation, resolves p-values well below 1e-10 at large N. `"permutation"`
@@ -387,8 +396,7 @@ def _pairwise_stats(
         hits = int(np.sum(np.abs(perm_means) >= abs(delta)))
         p_value = (hits + 1) / (n_permutations + 1)
 
-    win_rate = float((scores_b > scores_a).mean())
-    return delta, ci_low, ci_high, p_value, win_rate
+    return delta, ci_low, ci_high, p_value
 
 
 def compare_pair(
@@ -433,7 +441,7 @@ def compare_pair(
     for m in metrics:
         scores_a = per_query[name_a][m.value]
         scores_b = per_query[name_b][m.value]
-        delta, ci_low, ci_high, p, win_rate = _pairwise_stats(
+        delta, ci_low, ci_high, p = _pairwise_stats(
             scores_a,
             scores_b,
             n_bootstrap=n_bootstrap,
@@ -451,7 +459,8 @@ def compare_pair(
                 ci_low=ci_low,
                 ci_high=ci_high,
                 p_value=p,
-                win_rate=win_rate,
+                win_rate=float((scores_b > scores_a).mean()),
+                loss_rate=float((scores_a > scores_b).mean()),
             )
         )
 
