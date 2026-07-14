@@ -1,6 +1,7 @@
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
@@ -13,6 +14,7 @@ from qdrant_client import QdrantClient, models
 from src.dataset import Document
 from src.doc_mapping import build_did_to_pids
 from src.encoder import post_with_retry
+from src.ngram_analysis import NgramStats, ngrams, tokenize
 from src.search import Searcher, SearchHit, dedupe_by_document
 
 logger = logging.getLogger(__name__)
@@ -195,6 +197,77 @@ class QdrantLateInteractionStrategy(RerankStrategy):
             next(iter(self._local_model.query_embed(query))), dtype=np.float32
         )
         return matrix.tolist()
+
+
+class NgramBM25Strategy(RerankStrategy):
+    """Lexical contiguity reranking: BM25 over word n-grams (default bigrams).
+
+    Scores candidates by exact n-gram overlap with the query using
+    corpus-level IDF statistics (`NgramStats`). Pure Python, no model, no
+    index — targets the signal that identifies CLERC gold passages: verbatim
+    spans copied from the cited case. Validated by the gold-vs-hard-negatives
+    diagnostic (`analyze_ngram_signal`) before this implementation existed.
+    """
+
+    name: ClassVar[str] = "NgramBM25"
+
+    def __init__(self, stats: NgramStats) -> None:
+        self._stats = stats
+
+    def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
+        if not hits:
+            return []
+        query_grams = self._stats.text_grams(query)
+        rescored = []
+        for hit in hits:
+            tokens = tokenize(hit.text)
+            counts = Counter(ngrams(tokens, self._stats.max_n))
+            score = self._stats.score(query_grams, counts, len(tokens))
+            rescored.append(hit.model_copy(update={"score": score}))
+        rescored.sort(key=lambda h: h.score, reverse=True)
+        return rescored
+
+
+class FusedNgramStrategy(RerankStrategy):
+    """Client-side RRF of the incoming ranking with a bigram-BM25 ranking.
+
+    Replacement reranking (`NgramBM25Strategy`) discards the first stage's
+    ordering on every query to exploit a signal decisive only on some; this
+    strategy keeps the first stage as one RRF voter and the n-gram order as
+    a second. Candidates with no n-gram evidence tie at the bottom of the
+    n-gram ranking in incoming order, so they keep their first-stage position
+    instead of being demoted by lexical noise — bigrams can promote, not veto.
+    """
+
+    name: ClassVar[str] = "FusedNgram"
+
+    def __init__(self, stats: NgramStats, rrf_k: int = 60) -> None:
+        self._stats = stats
+        self.rrf_k = rrf_k
+
+    def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
+        if not hits:
+            return []
+        query_grams = self._stats.text_grams(query)
+        ngram_scores = []
+        for hit in hits:
+            tokens = tokenize(hit.text)
+            counts = Counter(ngrams(tokens, self._stats.max_n))
+            ngram_scores.append(self._stats.score(query_grams, counts, len(tokens)))
+
+        # ties (e.g. zero-evidence candidates) keep incoming order
+        ngram_order = sorted(
+            range(len(hits)), key=lambda i: (-ngram_scores[i], i)
+        )
+        ngram_rank = {i: r for r, i in enumerate(ngram_order, start=1)}
+        fused = [
+            (1 / (self.rrf_k + i + 1) + 1 / (self.rrf_k + ngram_rank[i]), i)
+            for i in range(len(hits))
+        ]
+        fused.sort(key=lambda t: (-t[0], t[1]))
+        return [
+            hits[i].model_copy(update={"score": score}) for score, i in fused
+        ]
 
 
 class OpenRouterRerankStrategy(RerankStrategy):
